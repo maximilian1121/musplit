@@ -1,0 +1,5 @@
+fastapi
+uvicorn[standard]
+audio-separator[cpu]
+yt-dlp
+python-multipart
