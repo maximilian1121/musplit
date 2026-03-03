@@ -16,13 +16,26 @@
                 </header>
 
                 <div
-                    class="bg-zinc-900 border border-zinc-800 p-6 rounded-3xl shadow-2xl"
+                    class="bg-zinc-900 border border-zinc-800 p-6 rounded-3xl shadow-2xl space-y-4"
                 >
+                    <!-- MODEL SELECT -->
+                    <div>
+                        <label
+                            class="text-xs uppercase font-bold text-zinc-400 block mb-2"
+                            >Model</label
+                        >
+                        <select
+                            id="model-select"
+                            class="w-full bg-zinc-950 border border-zinc-800 rounded-2xl p-3 text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none transition"
+                        ></select>
+                    </div>
+
                     <textarea
                         id="urls"
                         placeholder="Paste YouTube links (one per line)..."
-                        class="w-full h-40 bg-zinc-950 border-zinc-800 rounded-2xl p-4 focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none transition mb-4 font-mono text-sm"
+                        class="w-full h-40 bg-zinc-950 border-zinc-800 rounded-2xl p-4 focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none transition font-mono text-sm"
                     ></textarea>
+
                     <button
                         onclick="startBulk()"
                         class="w-full bg-blue-600 text-white hover:bg-blue-500 py-4 rounded-2xl font-bold text-lg transition transform active:scale-95 shadow-lg shadow-blue-900/20"
@@ -51,65 +64,106 @@
         </div>
 
         <script>
-            // XSS-Safe History Loading
+            let models = [];
+
+            async function loadModels() {
+                const res = await fetch("/models");
+                const data = await res.json(); // data is now an object keyed by filename
+                models = Object.entries(data).map(([file, info]) => ({
+                    file,
+                    label: info.Name, // use the Name field as the display label
+                    type: info.Type,
+                    stems: info.Stems,
+                    sdr: info.SDR,
+                }));
+
+                const select = document.getElementById("model-select");
+                select.innerHTML = "";
+
+                models.forEach((m) => {
+                    const opt = document.createElement("option");
+                    opt.value = m.file;
+                    opt.textContent = m.label; // show the Name field
+                    select.appendChild(opt);
+                });
+
+                select.value = "htdemucs.yaml";
+            }
+
             async function loadHistory() {
                 const res = await fetch("/history");
                 const data = await res.json();
                 const list = document.getElementById("history-list");
-                list.innerHTML = ""; // Clear current
+                list.innerHTML = "";
 
                 Object.entries(data)
                     .reverse()
                     .forEach(([hash, item]) => {
                         const card = document.createElement("div");
                         card.className =
-                            "p-4 bg-zinc-950 border border-zinc-800 rounded-2xl hover:border-zinc-600 transition group";
+                            "p-4 bg-zinc-950 border border-zinc-800 rounded-2xl hover:border-zinc-600 transition group space-y-3";
 
                         const title = document.createElement("p");
                         title.className =
-                            "font-bold text-sm truncate text-white mb-3";
+                            "font-bold text-sm truncate text-white";
                         title.textContent = item.title;
 
+                        const model = document.createElement("p");
+                        model.className = "text-[10px] text-zinc-500 font-mono";
+                        model.textContent = item.model || "Unknown Model";
+
                         const footer = document.createElement("div");
-                        footer.className = "flex justify-between items-center";
+                        footer.className =
+                            "flex justify-between items-center gap-2";
 
-                        const hashTag = document.createElement("span");
-                        hashTag.className =
-                            "text-[9px] font-mono text-zinc-600 uppercase";
-                        hashTag.textContent = hash;
-
-                        const btn = document.createElement("a");
-                        btn.href = `/download/${item.zip}`;
-                        btn.textContent = "Download ZIP";
-                        btn.className =
+                        const btnDownload = document.createElement("a");
+                        btnDownload.href = `/download/${item.zip}`;
+                        btnDownload.textContent = "Download ZIP";
+                        btnDownload.className =
                             "text-[11px] bg-zinc-800 group-hover:bg-blue-600 px-3 py-1.5 rounded-lg transition font-bold";
 
-                        footer.appendChild(hashTag);
-                        footer.appendChild(btn);
+                        const btnResplit = document.createElement("button");
+                        btnResplit.textContent = "Resplit";
+                        btnResplit.className =
+                            "text-[11px] bg-zinc-800 hover:bg-purple-600 px-3 py-1.5 rounded-lg transition font-bold";
+                        btnResplit.onclick = () => {
+                            document.getElementById("urls").value = item.url;
+                            startBulk(true);
+                        };
+
+                        footer.appendChild(btnDownload);
+                        footer.appendChild(btnResplit);
+
                         card.appendChild(title);
+                        card.appendChild(model);
                         card.appendChild(footer);
                         list.appendChild(card);
                     });
             }
 
-            function startBulk() {
+            function startBulk(forceResplit = false) {
+                const selectedModel =
+                    document.getElementById("model-select").value;
+
                 const urls = document
                     .getElementById("urls")
                     .value.split("\n")
                     .filter((l) => l.trim().startsWith("http"));
+
                 urls.forEach((url) => {
                     const id = "t" + Math.random().toString(36).substr(2, 9);
-                    createQueueCard(url, id);
+                    createQueueCard(url, id, selectedModel);
 
                     const es = new EventSource(
-                        `/separate?url=${encodeURIComponent(url)}`,
+                        `/separate?url=${encodeURIComponent(url)}&model=${encodeURIComponent(selectedModel)}`,
                     );
+
                     es.onmessage = (e) => {
                         const data = JSON.parse(e.data);
                         const statusEl = document.getElementById(
                             `status-${id}`,
                         );
-                        statusEl.textContent = data.status; // Safe from XSS
+                        statusEl.textContent = data.status;
 
                         if (data.complete) {
                             statusEl.className =
@@ -126,7 +180,7 @@
                 });
             }
 
-            function createQueueCard(url, id) {
+            function createQueueCard(url, id, model) {
                 const div = document.createElement("div");
                 div.className =
                     "bg-zinc-900 border border-zinc-800 p-5 rounded-2xl flex justify-between items-center";
@@ -139,6 +193,11 @@
                     "text-[10px] text-zinc-600 truncate mb-1 italic";
                 urlText.textContent = url;
 
+                const modelText = document.createElement("p");
+                modelText.className =
+                    "text-[10px] text-purple-400 font-mono mb-1";
+                modelText.textContent = model;
+
                 const status = document.createElement("p");
                 status.id = `status-${id}`;
                 status.className =
@@ -146,12 +205,17 @@
                 status.textContent = "Connecting...";
 
                 info.appendChild(urlText);
+                info.appendChild(modelText);
                 info.appendChild(status);
                 div.appendChild(info);
+
                 document.getElementById("queue").prepend(div);
             }
 
-            window.onload = loadHistory;
+            window.onload = async () => {
+                await loadModels();
+                await loadHistory();
+            };
         </script>
     </body>
 </html>

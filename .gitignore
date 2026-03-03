@@ -3,3 +3,4 @@ separated_audio/**
 ./.vscode/**
 ./__pycache__/**
 history.json
+__pycache__/main.cpython-312.pyc

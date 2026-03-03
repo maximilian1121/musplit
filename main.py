@@ -1,18 +1,27 @@
-import os, json, hashlib, asyncio, shutil
+import os
+import json
+import hashlib
+import asyncio
+import shutil
+import re
+from pathlib import Path
+
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse, FileResponse
 from audio_separator.separator import Separator
 import yt_dlp
 
 app = FastAPI()
+
 HISTORY_FILE = "history.json"
 OUTPUT_DIR = "separated_audio"
 MODEL_DIR = "models"
-split_lock = asyncio.Lock()
 
-for d in [OUTPUT_DIR, MODEL_DIR]:
-    if not os.path.exists(d):
-        os.makedirs(d)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(MODEL_DIR, exist_ok=True)
+
+split_lock = asyncio.Lock()
+history_lock = asyncio.Lock()
 
 
 def get_history():
@@ -30,72 +39,122 @@ def save_history(history):
         json.dump(history, f, indent=4)
 
 
-async def process_task(url: str, task_hash: str):
-    history = get_history()
-    if task_hash in history and history[task_hash].get("status") == "complete":
-        yield f"data: {json.dumps({'status': 'Already exists!', 'complete': True, 'hash': task_hash})}\n\n"
-        return
+def sanitize_filename(name):
+    """Removes characters that are illegal in file systems."""
+    return re.sub(r'[\\/*?:"<>|]', "", name)
 
+
+# ------------------------
+# Separator setup
+# ------------------------
+sep = Separator(output_dir=OUTPUT_DIR, model_file_dir=MODEL_DIR)
+current_model = None
+AVAILABLE_MODELS = sep.get_simplified_model_list()
+
+
+# ------------------------
+# Core processing
+# ------------------------
+async def process_task(url: str, task_hash: str, model_name: str):
     try:
-        # 1. Download & Convert to WAV (Fixes the webm complaint)
-        yield f"data: {json.dumps({'status': 'Downloading & Converting...', 'hash': task_hash})}\n\n"
-        temp_input = os.path.join(OUTPUT_DIR, f"{task_hash}_raw")
+        base_path = Path(OUTPUT_DIR).resolve()
+        task_folder = base_path / task_hash
+        task_folder.mkdir(parents=True, exist_ok=True)
 
-        ydl_opts = {
-            "format": "bestaudio/best",
-            "outtmpl": temp_input,
-            "quiet": True,
-            "postprocessors": [
-                {
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "wav",
-                    "preferredquality": "192",
-                }
-            ],
-        }
+        # 1. Fetch metadata first to get the title
+        yield f"data: {json.dumps({'status': 'Fetching metadata...'})}\n\n"
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            title = info.get("title", "Unknown Track")
-            input_wav = f"{temp_input}.wav"
+        with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+            raw_title = info.get("title", "Unknown_Track")
+            clean_title = sanitize_filename(raw_title)
 
-        # 2. Queue for AI
-        yield f"data: {json.dumps({'status': 'Waiting in Queue...', 'hash': task_hash})}\n\n"
+        # Path for the permanent cached audio
+        wav_path = task_folder / f"{clean_title}.wav"
 
+        # 2. Check Cache / Download
+        if wav_path.exists():
+            yield f"data: {json.dumps({'status': 'Using cached audio', 'title': clean_title})}\n\n"
+        else:
+            yield f"data: {json.dumps({'status': 'Downloading...'})}\n\n"
+            ydl_opts = {
+                "format": "bestaudio/best",
+                "outtmpl": str(task_folder / f"{clean_title}.%(ext)s"),
+                "quiet": True,
+                "postprocessors": [
+                    {"key": "FFmpegExtractAudio", "preferredcodec": "wav"}
+                ],
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.extract_info(url, download=True)
+
+        # 3. Separation
         async with split_lock:
-            yield f"data: {json.dumps({'status': 'Splitting (UVR-MDX)...', 'hash': task_hash})}\n\n"
+            global current_model
+            if model_name != current_model:
+                yield f"data: {json.dumps({'status': f'Loading {model_name}'})}\n\n"
+                sep.load_model(model_name)
+                current_model = model_name
 
-            task_folder = os.path.join(OUTPUT_DIR, task_hash)
-            if not os.path.exists(task_folder):
-                os.makedirs(task_folder)
+            yield f"data: {json.dumps({'status': 'Separating audio'})}\n\n"
 
-            sep = Separator(output_dir=task_folder, model_file_dir=MODEL_DIR)
-            sep.load_model("UVR-MDX-NET-Voc_FT.onnx")
-            output_files = sep.separate(input_wav)
+            stems_temp_dir = task_folder / "stems_temp"
+            stems_temp_dir.mkdir(exist_ok=True)
 
-            # Create ZIP
-            zip_name = f"{task_hash}_stems"
-            shutil.make_archive(os.path.join(OUTPUT_DIR, zip_name), "zip", task_folder)
+            sep.output_dir = str(stems_temp_dir)
+            # The library typically prefixes the output with the input filename
+            output_files = sep.separate(str(wav_path))
 
-        # 3. Cleanup & Save
-        if os.path.exists(input_wav):
-            os.remove(input_wav)
-        history[task_hash] = {
-            "url": url,
-            "status": "complete",
-            "title": title,
-            "zip": f"{zip_name}.zip",
-        }
-        save_history(history)
-        yield f"data: {json.dumps({'status': 'Finished!', 'hash': task_hash, 'complete': True})}\n\n"
+            # Manual move fix
+            for file_name in output_files:
+                stray_file = base_path / file_name
+                target_file = stems_temp_dir / file_name
+                if stray_file.exists() and not target_file.exists():
+                    shutil.move(str(stray_file), str(target_file))
+
+            # Copy the original titled wav into the zip
+            shutil.copy(
+                str(wav_path), str(stems_temp_dir / f"{clean_title}_Original.wav")
+            )
+
+            # 4. Zip the temp folder
+            yield f"data: {json.dumps({'status': 'Zipping...'})}\n\n"
+            zip_filename = f"{clean_title}_{task_hash}_stems"
+            shutil.make_archive(
+                str(base_path / zip_filename), "zip", str(stems_temp_dir)
+            )
+
+            shutil.rmtree(stems_temp_dir)
+
+        # 5. History update
+        async with history_lock:
+            h = get_history()
+            h[task_hash] = {
+                "url": url,
+                "title": clean_title,
+                "zip": f"{zip_filename}.zip",
+                "model": model_name,
+                "status": "complete",
+            }
+            save_history(h)
+
+        yield f"data: {json.dumps({'status': 'Done!', 'complete': True, 'zip': f'{zip_filename}.zip'})}\n\n"
 
     except Exception as e:
-        yield f"data: {json.dumps({'status': f'Error: {str(e)}', 'hash': task_hash, 'error': True})}\n\n"
+        yield f"data: {json.dumps({'status': f'Error: {str(e)}', 'error': True})}\n\n"
 
 
+# ------------------------
+# API Endpoints
+# ------------------------
 @app.get("/")
 async def index():
     return FileResponse("index.html")
+
+
+@app.get("/models")
+async def models_api():
+    return AVAILABLE_MODELS
 
 
 @app.get("/history")
@@ -105,14 +164,20 @@ async def history_api():
 
 @app.get("/download/{filename}")
 async def download(filename: str):
-    # Basic path traversal protection
     safe_name = os.path.basename(filename)
-    return FileResponse(os.path.join(OUTPUT_DIR, safe_name), filename=safe_name)
+    file_path = os.path.join(OUTPUT_DIR, safe_name)
+    if os.path.exists(file_path):
+        return FileResponse(file_path, filename=safe_name)
+    return {"error": "File not found."}
 
 
 @app.get("/separate")
-async def separate_endpoint(url: str):
-    task_hash = hashlib.md5(url.encode()).hexdigest()[:10]
+async def separate_api(url: str, model: str):
+    if model not in AVAILABLE_MODELS:
+        return {"error": "Invalid model name."}
+
+    task_hash = hashlib.md5((url + model).encode()).hexdigest()[:10]
+
     return StreamingResponse(
-        process_task(url, task_hash), media_type="text/event-stream"
+        process_task(url, task_hash, model), media_type="text/event-stream"
     )
