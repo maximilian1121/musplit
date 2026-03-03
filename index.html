@@ -1,0 +1,160 @@
+<!doctype html>
+<html class="dark">
+    <head>
+        <script src="https://cdn.tailwindcss.com"></script>
+        <title>Stems.AI | UVR-MDX-NET</title>
+    </head>
+    <body class="bg-zinc-950 text-zinc-100 min-h-screen p-4 md:p-10 font-sans">
+        <div class="max-w-5xl mx-auto grid grid-cols-1 lg:grid-cols-3 gap-10">
+            <div class="lg:col-span-2 space-y-6">
+                <header>
+                    <h1
+                        class="text-3xl font-black tracking-tighter text-white uppercase italic"
+                    >
+                        Stems.AI
+                    </h1>
+                    <p class="text-zinc-500 font-medium">
+                        UVR-MDX-NET-Voc_FT High-Fidelity Extraction
+                    </p>
+                </header>
+
+                <div
+                    class="bg-zinc-900 border border-zinc-800 p-6 rounded-3xl shadow-2xl"
+                >
+                    <textarea
+                        id="urls"
+                        placeholder="Paste YouTube links (one per line)..."
+                        class="w-full h-40 bg-zinc-950 border-zinc-800 rounded-2xl p-4 focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none transition mb-4 font-mono text-sm"
+                    ></textarea>
+                    <button
+                        onclick="startBulk()"
+                        class="w-full bg-blue-600 text-white hover:bg-blue-500 py-4 rounded-2xl font-bold text-lg transition transform active:scale-95 shadow-lg shadow-blue-900/20"
+                    >
+                        Process Stems
+                    </button>
+                </div>
+
+                <div id="queue" class="space-y-3"></div>
+            </div>
+
+            <div
+                class="bg-zinc-900 border border-zinc-800 p-6 rounded-3xl h-[650px] flex flex-col shadow-2xl"
+            >
+                <h2 class="text-xl font-bold mb-6 flex items-center gap-2">
+                    <span
+                        class="w-2 h-2 bg-green-500 rounded-full animate-pulse"
+                    ></span>
+                    History
+                </h2>
+                <div
+                    id="history-list"
+                    class="space-y-3 overflow-y-auto flex-1 pr-2"
+                ></div>
+            </div>
+        </div>
+
+        <script>
+            // XSS-Safe History Loading
+            async function loadHistory() {
+                const res = await fetch("/history");
+                const data = await res.json();
+                const list = document.getElementById("history-list");
+                list.innerHTML = ""; // Clear current
+
+                Object.entries(data)
+                    .reverse()
+                    .forEach(([hash, item]) => {
+                        const card = document.createElement("div");
+                        card.className =
+                            "p-4 bg-zinc-950 border border-zinc-800 rounded-2xl hover:border-zinc-600 transition group";
+
+                        const title = document.createElement("p");
+                        title.className =
+                            "font-bold text-sm truncate text-white mb-3";
+                        title.textContent = item.title;
+
+                        const footer = document.createElement("div");
+                        footer.className = "flex justify-between items-center";
+
+                        const hashTag = document.createElement("span");
+                        hashTag.className =
+                            "text-[9px] font-mono text-zinc-600 uppercase";
+                        hashTag.textContent = hash;
+
+                        const btn = document.createElement("a");
+                        btn.href = `/download/${item.zip}`;
+                        btn.textContent = "Download ZIP";
+                        btn.className =
+                            "text-[11px] bg-zinc-800 group-hover:bg-blue-600 px-3 py-1.5 rounded-lg transition font-bold";
+
+                        footer.appendChild(hashTag);
+                        footer.appendChild(btn);
+                        card.appendChild(title);
+                        card.appendChild(footer);
+                        list.appendChild(card);
+                    });
+            }
+
+            function startBulk() {
+                const urls = document
+                    .getElementById("urls")
+                    .value.split("\n")
+                    .filter((l) => l.trim().startsWith("http"));
+                urls.forEach((url) => {
+                    const id = "t" + Math.random().toString(36).substr(2, 9);
+                    createQueueCard(url, id);
+
+                    const es = new EventSource(
+                        `/separate?url=${encodeURIComponent(url)}`,
+                    );
+                    es.onmessage = (e) => {
+                        const data = JSON.parse(e.data);
+                        const statusEl = document.getElementById(
+                            `status-${id}`,
+                        );
+                        statusEl.textContent = data.status; // Safe from XSS
+
+                        if (data.complete) {
+                            statusEl.className =
+                                "text-green-400 font-black uppercase text-xs";
+                            es.close();
+                            loadHistory();
+                        }
+                        if (data.error) {
+                            statusEl.className =
+                                "text-red-500 font-black uppercase text-xs";
+                            es.close();
+                        }
+                    };
+                });
+            }
+
+            function createQueueCard(url, id) {
+                const div = document.createElement("div");
+                div.className =
+                    "bg-zinc-900 border border-zinc-800 p-5 rounded-2xl flex justify-between items-center";
+
+                const info = document.createElement("div");
+                info.className = "flex-1 min-w-0";
+
+                const urlText = document.createElement("p");
+                urlText.className =
+                    "text-[10px] text-zinc-600 truncate mb-1 italic";
+                urlText.textContent = url;
+
+                const status = document.createElement("p");
+                status.id = `status-${id}`;
+                status.className =
+                    "text-blue-500 font-black uppercase text-xs tracking-widest";
+                status.textContent = "Connecting...";
+
+                info.appendChild(urlText);
+                info.appendChild(status);
+                div.appendChild(info);
+                document.getElementById("queue").prepend(div);
+            }
+
+            window.onload = loadHistory;
+        </script>
+    </body>
+</html>

@@ -1,0 +1,5 @@
+models/**
+separated_audio/**
+./.vscode/**
+./__pycache__/**
+history.json
